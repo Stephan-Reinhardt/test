@@ -1,0 +1,250 @@
+import javax.smartcardio.*;
+import java.util.*;
+
+/**
+ * Minimal PIN-reset / PIN-change test harness for a ReinerSCT cyberJack
+ * (or any PC/SC pinpad reader), using only javax.smartcardio from JDK 8.
+ *
+ *   javac PinResetTest.java
+ *   java  PinResetTest            # uses first reader whose name contains the hint
+ *   java  PinResetTest 1          # force reader index 1
+ *
+ * What it does, in order:
+ *   1. Lists readers (so you see the exact name Win11 gives the cyberJack).
+ *   2. Connects to the card, prints protocol + ATR.
+ *   3. Asks the reader which PIN features it exposes  <-- THE KEY DIAGNOSTIC.
+ *      If VERIFY_PIN_DIRECT is present but MODIFY_PIN_DIRECT is NOT, that alone
+ *      explains why "verify works, reset fails" after the Win10 -> Win11 move:
+ *      the driver no longer offers secure PIN modify.
+ *   4. Only if DO_MODIFY=true: sends a secure PIN_MODIFY and prints the status word.
+ *
+ * IMPORTANT SAFETY NOTE:
+ *   A failed PIN change still decrements the PIN retry counter. Running the
+ *   modify step repeatedly with a wrong old PIN can BLOCK the card (then you
+ *   need the PUK). Keep DO_MODIFY=false until discovery looks right, and don't
+ *   loop the modify step.
+ *
+ *   The PIN_MODIFY byte layout below is ILLUSTRATIVE. The exact field values
+ *   (format string, lengths, offsets, language, PIN reference) are specific to
+ *   your card application. The reliable move: in your real (old) app, log the
+ *   byte[] you currently pass to transmitControlCommand for the modify, and
+ *   paste those exact bytes into buildPinModify(). Then this harness sends the
+ *   identical command in a clean environment -> if it still fails here, it's the
+ *   OS/driver, not your surrounding code.
+ */
+public class PinResetTest {
+
+    // ===================== CONFIG: set for YOUR setup =====================
+    static final String  READER_NAME_HINT = "cyberJack"; // substring; null = first reader
+    static final String  PROTOCOL         = "*";          // "T=0", "T=1", or "*"
+    static final boolean USE_EXCLUSIVE    = true;         // hold the card across the call
+
+    // Optional: SELECT an application/AID before the PIN change. null = skip.
+    static final byte[]  SELECT_AID       = null;         // e.g. {(byte)0xA0,0x00,...}
+
+    // CHANGE REFERENCE DATA APDU header (ISO 7816-4, INS 0x24) for secure modify.
+    // The reader fills the PIN(s) in via the pinpad; you supply the header.
+    static final byte    CRD_CLA = 0x00;
+    static final byte    CRD_INS = 0x24;   // CHANGE REFERENCE DATA
+    static final byte    CRD_P1  = 0x00;   // 0x00 = old+new presented; 0x01 = new only
+    static final byte    CRD_P2  = 0x01;   // PIN reference  <-- CARD SPECIFIC
+
+    // Keep false first. Set true only after discovery + filling card-specific bytes.
+    static final boolean DO_MODIFY = false;
+    // ======================================================================
+
+    // PC/SC v2 part 10 feature tags
+    static final int FEATURE_VERIFY_PIN_DIRECT  = 0x06;
+    static final int FEATURE_MODIFY_PIN_DIRECT  = 0x07;
+    static final int FEATURE_IFD_PIN_PROPERTIES = 0x0A;
+    static final int FEATURE_GET_TLV_PROPERTIES = 0x12;
+
+    // CM_IOCTL_GET_FEATURE_REQUEST: Windows = 0x00313520, pcsclite(Linux) = 0x42000D48
+    static final int IOCTL_GET_FEATURE_REQUEST  = 0x00313520;
+
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable t) {        // catch everything so nothing is swallowed
+            System.out.println("FATAL:");
+            t.printStackTrace(System.out);
+        }
+    }
+
+    static void run(String[] args) throws Exception {
+        TerminalFactory tf = TerminalFactory.getDefault();
+        System.out.println("Provider: " + tf.getProvider());
+
+        List<CardTerminal> terminals;
+        try {
+            terminals = tf.terminals().list();
+        } catch (CardException e) {
+            System.out.println("Could not list readers (Smart Card service down / no reader?).");
+            e.printStackTrace(System.out);
+            return;
+        }
+        if (terminals.isEmpty()) { System.out.println("No readers found."); return; }
+
+        System.out.println("Readers:");
+        for (int i = 0; i < terminals.size(); i++)
+            System.out.println("  [" + i + "] " + terminals.get(i).getName());
+
+        CardTerminal term = pick(terminals, args);
+        System.out.println("Using: " + term.getName());
+
+        if (!term.isCardPresent()) { System.out.println("No card present."); return; }
+
+        Card card = term.connect(PROTOCOL);
+        System.out.println("Connected. protocol=" + card.getProtocol());
+        System.out.println("ATR=" + hex(card.getATR().getBytes()));
+
+        if (USE_EXCLUSIVE) card.beginExclusive();
+        try {
+            // ---- KEY DIAGNOSTIC: what PIN features does the driver expose? ----
+            Map<Integer, Integer> features = getFeatures(card);
+            System.out.println("PIN features reported by the reader:");
+            show(features, FEATURE_VERIFY_PIN_DIRECT,  "VERIFY_PIN_DIRECT");
+            show(features, FEATURE_MODIFY_PIN_DIRECT,  "MODIFY_PIN_DIRECT");
+            show(features, FEATURE_IFD_PIN_PROPERTIES, "IFD_PIN_PROPERTIES");
+            show(features, FEATURE_GET_TLV_PROPERTIES, "GET_TLV_PROPERTIES");
+
+            boolean canModify = features.containsKey(FEATURE_MODIFY_PIN_DIRECT);
+            if (!canModify) {
+                System.out.println(">>> MODIFY_PIN_DIRECT is NOT exposed by this driver.");
+                System.out.println(">>> That alone explains a failing PIN reset on Win11.");
+                System.out.println(">>> Try the classic cyberJack Base Components driver instead.");
+            }
+
+            if (SELECT_AID != null) {
+                ResponseAPDU r = card.getBasicChannel()
+                        .transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, SELECT_AID));
+                System.out.println("SELECT SW=" + String.format("%04X", r.getSW()));
+            }
+
+            if (DO_MODIFY) {
+                if (!canModify) {
+                    System.out.println("Skipping modify: feature missing.");
+                } else {
+                    int ctl = features.get(FEATURE_MODIFY_PIN_DIRECT);
+                    byte[] struct = buildPinModify();
+                    System.out.println("PIN_MODIFY (" + struct.length + " bytes): " + hex(struct));
+                    System.out.println("Now enter OLD then NEW PIN on the cyberJack pad...");
+                    byte[] resp = card.transmitControlCommand(ctl, struct);
+                    System.out.println("Raw response: " + hex(resp));
+                    if (resp.length >= 2) {
+                        int s = ((resp[resp.length - 2] & 0xff) << 8) | (resp[resp.length - 1] & 0xff);
+                        System.out.println("Modify SW=" + String.format("%04X", s)
+                                + "  -> " + swMeaning(s));
+                    }
+                }
+            } else {
+                System.out.println("DO_MODIFY=false (safe discovery only).");
+                System.out.println("Set it true after filling the card-specific bytes.");
+            }
+        } finally {
+            if (USE_EXCLUSIVE) try { card.endExclusive(); } catch (Exception ignore) {}
+            card.disconnect(false);
+        }
+    }
+
+    /** Ask the reader for its feature list via CM_IOCTL_GET_FEATURE_REQUEST. */
+    static Map<Integer, Integer> getFeatures(Card card) {
+        Map<Integer, Integer> m = new LinkedHashMap<Integer, Integer>();
+        try {
+            byte[] r = card.transmitControlCommand(IOCTL_GET_FEATURE_REQUEST, new byte[0]);
+            // TLV triplets: tag(1) len(1) value(len bytes, big-endian control code)
+            int i = 0;
+            while (i + 2 <= r.length) {
+                int tag = r[i] & 0xff;
+                int len = r[i + 1] & 0xff;
+                i += 2;
+                if (i + len > r.length) break;
+                int val = 0;
+                for (int k = 0; k < len; k++) val = (val << 8) | (r[i + k] & 0xff);
+                i += len;
+                m.put(tag, val);
+            }
+        } catch (Exception e) {
+            System.out.println("GET_FEATURE_REQUEST failed:");
+            e.printStackTrace(System.out);
+        }
+        return m;
+    }
+
+    /**
+     * ILLUSTRATIVE PIN_MODIFY_STRUCTURE (PC/SC part 10). Replace the values with
+     * the exact bytes your working app sends (capture them by logging the byte[]
+     * passed to transmitControlCommand in the old code). Field meanings are noted
+     * so you can map them, but exact values are card/reader specific.
+     */
+    static byte[] buildPinModify() {
+        System.out.println("WARNING: using illustrative PIN_MODIFY values - replace with your card's.");
+        byte[] apdu = new byte[] { CRD_CLA, CRD_INS, CRD_P1, CRD_P2 }; // reader appends PIN data + Lc
+        byte[] s = new byte[] {
+            0x00,        // bTimeOut (0 = reader default)
+            0x00,        // bTimeOut2
+            (byte)0x82,  // bmFormatString        (PIN format - CARD SPECIFIC)
+            0x08,        // bmPINBlockString       (PIN block size)
+            0x00,        // bmPINLengthFormat
+            0x00,        // bInsertionOffsetOld    (offset of old PIN in APDU data)
+            0x00,        // bInsertionOffsetNew    (offset of new PIN in APDU data)
+            0x04,        // wPINMaxExtraDigit byte1 (min len - order varies by reader!)
+            0x0C,        // wPINMaxExtraDigit byte2 (max len)
+            0x03,        // bConfirmPIN            (confirm new PIN on pad)
+            0x02,        // bEntryValidationCondition (validation key pressed)
+            0x00,        // bNumberMessage
+            0x04, 0x09,  // wLangId (0x0409 = en-US; 0x0407 = de-DE)
+            0x00,        // bMsgIndex1
+            0x00,        // bMsgIndex2
+            0x00,        // bMsgIndex3
+            0x00, 0x00, 0x00, // bTeoPrologue
+            // ulDataLength (4 bytes, little-endian) + abData (the APDU template):
+            (byte)(apdu.length & 0xff), 0x00, 0x00, 0x00
+        };
+        byte[] out = new byte[s.length + apdu.length];
+        System.arraycopy(s, 0, out, 0, s.length);
+        System.arraycopy(apdu, 0, out, s.length, apdu.length);
+        return out;
+    }
+
+    static CardTerminal pick(List<CardTerminal> ts, String[] args) {
+        if (args.length > 0) {
+            try { return ts.get(Integer.parseInt(args[0].trim())); }
+            catch (Exception ignore) {}
+        }
+        if (READER_NAME_HINT != null)
+            for (CardTerminal t : ts)
+                if (t.getName().toLowerCase().contains(READER_NAME_HINT.toLowerCase()))
+                    return t;
+        return ts.get(0);
+    }
+
+    static void show(Map<Integer, Integer> m, int tag, String name) {
+        if (m.containsKey(tag))
+            System.out.println("  " + name + " = control code 0x"
+                    + String.format("%08X", m.get(tag)));
+        else
+            System.out.println("  " + name + " = (not present)");
+    }
+
+    static String swMeaning(int sw) {
+        if (sw == 0x9000) return "OK";
+        if (sw == 0x6982) return "security status not satisfied (auth state lost before modify?)";
+        if (sw == 0x6985) return "conditions of use not satisfied";
+        if ((sw & 0xFFF0) == 0x63C0) return "wrong PIN, " + (sw & 0x0F) + " attempt(s) left";
+        if (sw == 0x6983) return "PIN blocked / authentication method blocked";
+        if (sw == 0x6A80) return "wrong data in command field";
+        if (sw == 0x6A86) return "incorrect P1/P2";
+        if (sw == 0x6B00) return "wrong P1/P2";
+        if (sw == 0x6700) return "wrong length";
+        if (sw == 0x6D00) return "INS not supported";
+        return "see card spec";
+    }
+
+    static String hex(byte[] b) {
+        if (b == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format("%02X ", x));
+        return sb.toString().trim();
+    }
+}
