@@ -2,55 +2,68 @@ import javax.smartcardio.*;
 import java.util.*;
 
 /**
- * Minimal PIN-reset / PIN-change test harness for a ReinerSCT cyberJack
- * (or any PC/SC pinpad reader), using only javax.smartcardio from JDK 8.
+ * Two-step PIN-change test harness for a ReinerSCT cyberJack (or any PC/SC
+ * pinpad reader), using only javax.smartcardio from JDK 8.
  *
  *   javac PinResetTest.java
- *   java  PinResetTest            # uses first reader whose name contains the hint
+ *   java  PinResetTest            # auto-pick reader by name hint
  *   java  PinResetTest 1          # force reader index 1
  *
- * What it does, in order:
- *   1. Lists readers (so you see the exact name Win11 gives the cyberJack).
- *   2. Connects to the card, prints protocol + ATR.
- *   3. Asks the reader which PIN features it exposes  <-- THE KEY DIAGNOSTIC.
- *      If VERIFY_PIN_DIRECT is present but MODIFY_PIN_DIRECT is NOT, that alone
- *      explains why "verify works, reset fails" after the Win10 -> Win11 move:
- *      the driver no longer offers secure PIN modify.
- *   4. Only if DO_MODIFY=true: sends a secure PIN_MODIFY and prints the status word.
+ * It does secure VERIFY (FEATURE_VERIFY_PIN_DIRECT) then secure MODIFY
+ * (FEATURE_MODIFY_PIN_DIRECT) and lets you choose HOW they are sequenced:
  *
- * IMPORTANT SAFETY NOTE:
- *   A failed PIN change still decrements the PIN retry counter. Running the
- *   modify step repeatedly with a wrong old PIN can BLOCK the card (then you
- *   need the PUK). Keep DO_MODIFY=false until discovery looks right, and don't
- *   loop the modify step.
+ *   RUN_MODE = "SAME_HANDLE"        verify + modify on ONE card handle inside
+ *                                   ONE beginExclusive() transaction. This is
+ *                                   the correct way -> expect 9000 then 9000.
  *
- *   The PIN_MODIFY byte layout below is ILLUSTRATIVE. The exact field values
- *   (format string, lengths, offsets, language, PIN reference) are specific to
- *   your card application. The reliable move: in your real (old) app, log the
- *   byte[] you currently pass to transmitControlCommand for the modify, and
- *   paste those exact bytes into buildPinModify(). Then this harness sends the
- *   identical command in a clean environment -> if it still fails here, it's the
- *   OS/driver, not your surrounding code.
+ *   RUN_MODE = "RECONNECT_BETWEEN"  verify, then disconnect + reconnect, then
+ *                                   modify. This mimics an app that drops the
+ *                                   card handle between the two steps. On Win11
+ *                                   the card's authenticated PIN state is
+ *                                   usually cleared on reconnect, so the modify
+ *                                   arrives unauthenticated -> expect 6982/6985.
+ *
+ * If SAME_HANDLE passes and RECONNECT_BETWEEN fails, the bug in the old app is
+ * that it doesn't keep one exclusive handle across verify -> modify.
+ *
+ * SAFETY: a failed/unauthenticated step still decrements the PIN retry counter.
+ * Do NOT loop this with a wrong PIN; a few bad attempts can block the card and
+ * force the PUK. Keep DO_CHANGE=false until discovery looks right, then run once.
+ *
+ * The PIN_VERIFY / PIN_MODIFY field values below are ILLUSTRATIVE. Replace them
+ * with the exact bytes your working app sends (log the byte[] passed to
+ * transmitControlCommand in the old code and paste them in). The verify bytes
+ * are the gold standard: they already work in your app, so use them verbatim and
+ * the only variable left is the sequencing.
  */
 public class PinResetTest {
 
     // ===================== CONFIG: set for YOUR setup =====================
     static final String  READER_NAME_HINT = "cyberJack"; // substring; null = first reader
     static final String  PROTOCOL         = "*";          // "T=0", "T=1", or "*"
-    static final boolean USE_EXCLUSIVE    = true;         // hold the card across the call
+    static final boolean USE_EXCLUSIVE    = true;
 
-    // Optional: SELECT an application/AID before the PIN change. null = skip.
-    static final byte[]  SELECT_AID       = null;         // e.g. {(byte)0xA0,0x00,...}
+    static final String  RUN_MODE         = "SAME_HANDLE"; // or "RECONNECT_BETWEEN"
+    static final boolean RECONNECT_RESET  = false;         // disconnect(true) resets card between steps
 
-    // CHANGE REFERENCE DATA APDU header (ISO 7816-4, INS 0x24) for secure modify.
-    // The reader fills the PIN(s) in via the pinpad; you supply the header.
+    static final byte[]  SELECT_AID       = null;          // AID to SELECT before PIN ops; null = skip
+
+    // VERIFY APDU header (ISO 7816-4, INS 0x20). Reader fills the PIN via the pad.
+    static final byte    VFY_CLA = 0x00;
+    static final byte    VFY_INS = 0x20;   // VERIFY
+    static final byte    VFY_P1  = 0x00;
+    static final byte    VFY_P2  = 0x01;   // PIN reference  <-- CARD SPECIFIC
+
+    // CHANGE REFERENCE DATA APDU header (INS 0x24).
+    // After a separate VERIFY, many cards expect P1=0x01 (new PIN only).
+    // Without a pre-verify, P1=0x00 (old + new presented).
     static final byte    CRD_CLA = 0x00;
     static final byte    CRD_INS = 0x24;   // CHANGE REFERENCE DATA
-    static final byte    CRD_P1  = 0x00;   // 0x00 = old+new presented; 0x01 = new only
+    static final byte    CRD_P1  = 0x01;   // 0x01 = new only (post-verify); 0x00 = old+new
     static final byte    CRD_P2  = 0x01;   // PIN reference  <-- CARD SPECIFIC
 
-    // Keep false first. Set true only after discovery + filling card-specific bytes.
-    static final boolean DO_MODIFY = false;
+    // Keep false for safe discovery-only. Set true to actually run verify+modify.
+    static final boolean DO_CHANGE = false;
     // ======================================================================
 
     // PC/SC v2 part 10 feature tags
@@ -65,7 +78,7 @@ public class PinResetTest {
     public static void main(String[] args) {
         try {
             run(args);
-        } catch (Throwable t) {        // catch everything so nothing is swallowed
+        } catch (Throwable t) {
             System.out.println("FATAL:");
             t.printStackTrace(System.out);
         }
@@ -91,72 +104,125 @@ public class PinResetTest {
 
         CardTerminal term = pick(terminals, args);
         System.out.println("Using: " + term.getName());
-
         if (!term.isCardPresent()) { System.out.println("No card present."); return; }
 
-        Card card = term.connect(PROTOCOL);
-        System.out.println("Connected. protocol=" + card.getProtocol());
-        System.out.println("ATR=" + hex(card.getATR().getBytes()));
-
-        if (USE_EXCLUSIVE) card.beginExclusive();
+        // ---- read-only discovery ----
+        Card c = term.connect(PROTOCOL);
+        System.out.println("Connected. protocol=" + c.getProtocol());
+        System.out.println("ATR=" + hex(c.getATR().getBytes()));
+        if (USE_EXCLUSIVE) c.beginExclusive();
+        Map<Integer, Integer> features;
         try {
-            // ---- KEY DIAGNOSTIC: what PIN features does the driver expose? ----
-            Map<Integer, Integer> features = getFeatures(card);
+            features = getFeatures(c);
             System.out.println("PIN features reported by the reader:");
             show(features, FEATURE_VERIFY_PIN_DIRECT,  "VERIFY_PIN_DIRECT");
             show(features, FEATURE_MODIFY_PIN_DIRECT,  "MODIFY_PIN_DIRECT");
             show(features, FEATURE_IFD_PIN_PROPERTIES, "IFD_PIN_PROPERTIES");
-            show(features, FEATURE_GET_TLV_PROPERTIES, "GET_TLV_PROPERTIES");
+        } finally {
+            if (USE_EXCLUSIVE) try { c.endExclusive(); } catch (Exception ignore) {}
+            c.disconnect(false);
+        }
 
-            boolean canModify = features.containsKey(FEATURE_MODIFY_PIN_DIRECT);
-            if (!canModify) {
-                System.out.println(">>> MODIFY_PIN_DIRECT is NOT exposed by this driver.");
-                System.out.println(">>> That alone explains a failing PIN reset on Win11.");
-                System.out.println(">>> Try the classic cyberJack Base Components driver instead.");
-            }
+        boolean canVerify = features.containsKey(FEATURE_VERIFY_PIN_DIRECT);
+        boolean canModify = features.containsKey(FEATURE_MODIFY_PIN_DIRECT);
 
-            if (SELECT_AID != null) {
-                ResponseAPDU r = card.getBasicChannel()
-                        .transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, SELECT_AID));
-                System.out.println("SELECT SW=" + String.format("%04X", r.getSW()));
-            }
+        if (!DO_CHANGE) {
+            System.out.println("DO_CHANGE=false (discovery only). Set it true to run verify+modify.");
+            return;
+        }
+        if (!canVerify || !canModify) {
+            System.out.println("Cannot run 2-step: missing VERIFY or MODIFY feature.");
+            return;
+        }
 
-            if (DO_MODIFY) {
-                if (!canModify) {
-                    System.out.println("Skipping modify: feature missing.");
-                } else {
-                    int ctl = features.get(FEATURE_MODIFY_PIN_DIRECT);
-                    byte[] struct = buildPinModify();
-                    System.out.println("PIN_MODIFY (" + struct.length + " bytes): " + hex(struct));
-                    System.out.println("Now enter OLD then NEW PIN on the cyberJack pad...");
-                    byte[] resp = card.transmitControlCommand(ctl, struct);
-                    System.out.println("Raw response: " + hex(resp));
-                    if (resp.length >= 2) {
-                        int s = ((resp[resp.length - 2] & 0xff) << 8) | (resp[resp.length - 1] & 0xff);
-                        System.out.println("Modify SW=" + String.format("%04X", s)
-                                + "  -> " + swMeaning(s));
-                    }
-                }
-            } else {
-                System.out.println("DO_MODIFY=false (safe discovery only).");
-                System.out.println("Set it true after filling the card-specific bytes.");
-            }
+        System.out.println("=== Running 2-step PIN change, RUN_MODE=" + RUN_MODE + " ===");
+        if ("SAME_HANDLE".equals(RUN_MODE))      runSameHandle(term);
+        else if ("RECONNECT_BETWEEN".equals(RUN_MODE)) runReconnect(term);
+        else System.out.println("Unknown RUN_MODE: " + RUN_MODE);
+    }
+
+    /** Correct path: verify + modify on one handle inside one transaction. */
+    static void runSameHandle(CardTerminal term) throws Exception {
+        Card card = term.connect(PROTOCOL);
+        if (USE_EXCLUSIVE) card.beginExclusive();
+        try {
+            Map<Integer, Integer> f = getFeatures(card);
+            selectIfNeeded(card);
+            int sw1 = secureVerify(card, f);
+            if (sw1 != 0x9000) { System.out.println("Verify did not return 9000; stopping."); return; }
+            secureModify(card, f);
         } finally {
             if (USE_EXCLUSIVE) try { card.endExclusive(); } catch (Exception ignore) {}
             card.disconnect(false);
         }
     }
 
-    /** Ask the reader for its feature list via CM_IOCTL_GET_FEATURE_REQUEST. */
+    /** Bug-repro path: verify, drop the handle, reconnect, then modify. */
+    static void runReconnect(CardTerminal term) throws Exception {
+        // step 1: verify on its own handle
+        Card c1 = term.connect(PROTOCOL);
+        int sw1;
+        if (USE_EXCLUSIVE) c1.beginExclusive();
+        try {
+            Map<Integer, Integer> f1 = getFeatures(c1);
+            selectIfNeeded(c1);
+            sw1 = secureVerify(c1, f1);
+        } finally {
+            if (USE_EXCLUSIVE) try { c1.endExclusive(); } catch (Exception ignore) {}
+            c1.disconnect(RECONNECT_RESET);
+        }
+        if (sw1 != 0x9000) { System.out.println("Verify did not return 9000; stopping."); return; }
+
+        System.out.println("--- reconnecting (drops the card handle, like the old app) ---");
+        // step 2: modify on a fresh handle
+        Card c2 = term.connect(PROTOCOL);
+        if (USE_EXCLUSIVE) c2.beginExclusive();
+        try {
+            Map<Integer, Integer> f2 = getFeatures(c2);
+            selectIfNeeded(c2);
+            secureModify(c2, f2);
+        } finally {
+            if (USE_EXCLUSIVE) try { c2.endExclusive(); } catch (Exception ignore) {}
+            c2.disconnect(false);
+        }
+    }
+
+    static int secureVerify(Card card, Map<Integer, Integer> f) throws Exception {
+        int ctl = f.get(FEATURE_VERIFY_PIN_DIRECT);
+        byte[] s = buildPinVerify();
+        System.out.println("PIN_VERIFY (" + s.length + " bytes): " + hex(s));
+        System.out.println(">>> Enter CURRENT PIN on the cyberJack pad...");
+        byte[] resp = card.transmitControlCommand(ctl, s);
+        int sw = sw(resp);
+        System.out.println("Verify response: " + hex(resp) + "  SW=" + fmt(sw) + " -> " + swMeaning(sw));
+        return sw;
+    }
+
+    static int secureModify(Card card, Map<Integer, Integer> f) throws Exception {
+        int ctl = f.get(FEATURE_MODIFY_PIN_DIRECT);
+        byte[] s = buildPinModify();
+        System.out.println("PIN_MODIFY (" + s.length + " bytes): " + hex(s));
+        System.out.println(">>> Enter NEW PIN (and confirm) on the cyberJack pad...");
+        byte[] resp = card.transmitControlCommand(ctl, s);
+        int sw = sw(resp);
+        System.out.println("Modify response: " + hex(resp) + "  SW=" + fmt(sw) + " -> " + swMeaning(sw));
+        return sw;
+    }
+
+    static void selectIfNeeded(Card card) throws Exception {
+        if (SELECT_AID == null) return;
+        ResponseAPDU r = card.getBasicChannel()
+                .transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, SELECT_AID));
+        System.out.println("SELECT SW=" + fmt(r.getSW()));
+    }
+
     static Map<Integer, Integer> getFeatures(Card card) {
         Map<Integer, Integer> m = new LinkedHashMap<Integer, Integer>();
         try {
             byte[] r = card.transmitControlCommand(IOCTL_GET_FEATURE_REQUEST, new byte[0]);
-            // TLV triplets: tag(1) len(1) value(len bytes, big-endian control code)
             int i = 0;
             while (i + 2 <= r.length) {
-                int tag = r[i] & 0xff;
-                int len = r[i + 1] & 0xff;
+                int tag = r[i] & 0xff, len = r[i + 1] & 0xff;
                 i += 2;
                 if (i + len > r.length) break;
                 int val = 0;
@@ -171,46 +237,56 @@ public class PinResetTest {
         return m;
     }
 
-    /**
-     * ILLUSTRATIVE PIN_MODIFY_STRUCTURE (PC/SC part 10). Replace the values with
-     * the exact bytes your working app sends (capture them by logging the byte[]
-     * passed to transmitControlCommand in the old code). Field meanings are noted
-     * so you can map them, but exact values are card/reader specific.
-     */
-    static byte[] buildPinModify() {
-        System.out.println("WARNING: using illustrative PIN_MODIFY values - replace with your card's.");
-        byte[] apdu = new byte[] { CRD_CLA, CRD_INS, CRD_P1, CRD_P2 }; // reader appends PIN data + Lc
+    /** ILLUSTRATIVE PIN_VERIFY_STRUCTURE (PC/SC part 10). Replace with your app's bytes. */
+    static byte[] buildPinVerify() {
+        byte[] apdu = new byte[] { VFY_CLA, VFY_INS, VFY_P1, VFY_P2 };
         byte[] s = new byte[] {
-            0x00,        // bTimeOut (0 = reader default)
+            0x00,        // bTimeOut
             0x00,        // bTimeOut2
-            (byte)0x82,  // bmFormatString        (PIN format - CARD SPECIFIC)
-            0x08,        // bmPINBlockString       (PIN block size)
+            (byte)0x82,  // bmFormatString        (CARD SPECIFIC)
+            0x08,        // bmPINBlockString
             0x00,        // bmPINLengthFormat
-            0x00,        // bInsertionOffsetOld    (offset of old PIN in APDU data)
-            0x00,        // bInsertionOffsetNew    (offset of new PIN in APDU data)
-            0x04,        // wPINMaxExtraDigit byte1 (min len - order varies by reader!)
-            0x0C,        // wPINMaxExtraDigit byte2 (max len)
-            0x03,        // bConfirmPIN            (confirm new PIN on pad)
-            0x02,        // bEntryValidationCondition (validation key pressed)
+            0x04,        // wPINMaxExtraDigit byte1 (min - order varies by reader)
+            0x0C,        // wPINMaxExtraDigit byte2 (max)
+            0x02,        // bEntryValidationCondition
             0x00,        // bNumberMessage
-            0x04, 0x09,  // wLangId (0x0409 = en-US; 0x0407 = de-DE)
+            0x04, 0x09,  // wLangId (0x0409 en-US; 0x0407 de-DE)
+            0x00,        // bMsgIndex
+            0x00, 0x00, 0x00, // bTeoPrologue
+            (byte)(apdu.length & 0xff), 0x00, 0x00, 0x00 // ulDataLength (LE)
+        };
+        return concat(s, apdu);
+    }
+
+    /** ILLUSTRATIVE PIN_MODIFY_STRUCTURE (PC/SC part 10). Replace with your app's bytes. */
+    static byte[] buildPinModify() {
+        byte[] apdu = new byte[] { CRD_CLA, CRD_INS, CRD_P1, CRD_P2 };
+        byte[] s = new byte[] {
+            0x00,        // bTimeOut
+            0x00,        // bTimeOut2
+            (byte)0x82,  // bmFormatString        (CARD SPECIFIC)
+            0x08,        // bmPINBlockString
+            0x00,        // bmPINLengthFormat
+            0x00,        // bInsertionOffsetOld
+            0x00,        // bInsertionOffsetNew
+            0x04,        // wPINMaxExtraDigit byte1 (min)
+            0x0C,        // wPINMaxExtraDigit byte2 (max)
+            0x03,        // bConfirmPIN (confirm new PIN on pad)
+            0x02,        // bEntryValidationCondition
+            0x00,        // bNumberMessage
+            0x04, 0x09,  // wLangId
             0x00,        // bMsgIndex1
             0x00,        // bMsgIndex2
             0x00,        // bMsgIndex3
             0x00, 0x00, 0x00, // bTeoPrologue
-            // ulDataLength (4 bytes, little-endian) + abData (the APDU template):
-            (byte)(apdu.length & 0xff), 0x00, 0x00, 0x00
+            (byte)(apdu.length & 0xff), 0x00, 0x00, 0x00 // ulDataLength (LE)
         };
-        byte[] out = new byte[s.length + apdu.length];
-        System.arraycopy(s, 0, out, 0, s.length);
-        System.arraycopy(apdu, 0, out, s.length, apdu.length);
-        return out;
+        return concat(s, apdu);
     }
 
     static CardTerminal pick(List<CardTerminal> ts, String[] args) {
         if (args.length > 0) {
-            try { return ts.get(Integer.parseInt(args[0].trim())); }
-            catch (Exception ignore) {}
+            try { return ts.get(Integer.parseInt(args[0].trim())); } catch (Exception ignore) {}
         }
         if (READER_NAME_HINT != null)
             for (CardTerminal t : ts)
@@ -220,25 +296,38 @@ public class PinResetTest {
     }
 
     static void show(Map<Integer, Integer> m, int tag, String name) {
-        if (m.containsKey(tag))
-            System.out.println("  " + name + " = control code 0x"
-                    + String.format("%08X", m.get(tag)));
-        else
-            System.out.println("  " + name + " = (not present)");
+        System.out.println(m.containsKey(tag)
+                ? "  " + name + " = control code 0x" + String.format("%08X", m.get(tag))
+                : "  " + name + " = (not present)");
     }
+
+    static int sw(byte[] resp) {
+        if (resp == null || resp.length < 2) return -1;
+        return ((resp[resp.length - 2] & 0xff) << 8) | (resp[resp.length - 1] & 0xff);
+    }
+
+    static String fmt(int sw) { return sw < 0 ? "(none)" : String.format("%04X", sw); }
 
     static String swMeaning(int sw) {
         if (sw == 0x9000) return "OK";
-        if (sw == 0x6982) return "security status not satisfied (auth state lost before modify?)";
+        if (sw == 0x6982) return "security status not satisfied (auth state lost before this step?)";
         if (sw == 0x6985) return "conditions of use not satisfied";
         if ((sw & 0xFFF0) == 0x63C0) return "wrong PIN, " + (sw & 0x0F) + " attempt(s) left";
-        if (sw == 0x6983) return "PIN blocked / authentication method blocked";
+        if (sw == 0x6983) return "PIN blocked";
         if (sw == 0x6A80) return "wrong data in command field";
         if (sw == 0x6A86) return "incorrect P1/P2";
         if (sw == 0x6B00) return "wrong P1/P2";
         if (sw == 0x6700) return "wrong length";
         if (sw == 0x6D00) return "INS not supported";
+        if (sw < 0)       return "no status word in response";
         return "see card spec";
+    }
+
+    static byte[] concat(byte[] a, byte[] b) {
+        byte[] out = new byte[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
     }
 
     static String hex(byte[] b) {
