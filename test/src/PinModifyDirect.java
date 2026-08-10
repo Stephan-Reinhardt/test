@@ -3,43 +3,44 @@ import java.io.ByteArrayOutputStream;
 import java.util.*;
 
 /**
- * Change a card PIN on a class-3 reader (cyberJack) as VERIFY(old) + CHANGE(new).
+git  * Change a card PIN on a class-3 reader (cyberJack).
  *
- * Two secure operations on ONE held handle (beginExclusive), which is the correct
- * form of the classic two-step flow and avoids any session-state loss between steps.
+ * Two modes (-Dmode=...):
+ *   combined (DEFAULT) : one MODIFY_PIN_DIRECT, CHANGE P1=00, reader collects
+ *                        OLD + NEW + confirm. The cyberJack's usual path.
+ *   split              : VERIFY_PIN_DIRECT(old) then MODIFY_PIN_DIRECT(new only, P1=01),
+ *                        both on one held handle.
  *
- * The card-specific values are overridable WITHOUT recompiling:
- *   java -Dp2=81 -Dpinmin=6 -Dpinmax=8 PinModifyDirect cyberJack
- *   -Dp2      PIN reference (hex), default 01   <-- the value most likely wrong
- *   -Dpinmin  min PIN digits (dec), default 6
- *   -Dpinmax  max PIN digits (dec), default 8
- *   -Dformat  bmFormatString (hex), default 02
- *   -Dblock   bmPINBlockString (hex), default 08
- *   -Dlenfmt  bmPINLengthFormat (hex), default 00
+ * Card-specific values overridable without recompiling:
+ *   -Dp2=81      PIN reference (hex)          [required for your card]
+ *   -Dpinmin=6   min PIN digits (dec)
+ *   -Dpinmax=8   max PIN digits (dec)
+ *   -Dformat=02  bmFormatString (hex)
+ *   -Dblock=08   bmPINBlockString (hex)
+ *   -Dlenfmt=00  bmPINLengthFormat (hex)
+ *   -Dmode=combined|split
  *
- * Java 8 compatible. Run from a console so you see the output.
+ * Example:  java -Dp2=81 PinModifyDirect cyberJack
+ * Java 8 compatible. Run from a console.
  */
 public class PinModifyDirect {
 
     private static int ctlCode(int code) { return 0x310000 | (code << 2); }
-    private static final int GET_FEATURE_REQUEST      = 3400;
+    private static final int GET_FEATURE_REQUEST       = 3400;
     private static final int FEATURE_VERIFY_PIN_DIRECT = 0x06;
     private static final int FEATURE_MODIFY_PIN_DIRECT = 0x07;
 
-    // --- card-specific, overridable via -D properties ---
-    private static final byte P2        = (byte) hexProp("p2", 0x01);
+    private static final byte P2        = (byte) hexProp("p2", 0x81);
     private static final int  PIN_MIN   = decProp("pinmin", 6);
     private static final int  PIN_MAX   = decProp("pinmax", 8);
     private static final byte BM_FORMAT = (byte) hexProp("format", 0x02);
     private static final byte BM_BLOCK  = (byte) hexProp("block", 0x08);
     private static final byte BM_LENFMT = (byte) hexProp("lenfmt", 0x00);
+    private static final String MODE    = System.getProperty("mode", "combined");
 
     public static void main(String[] args) throws Exception {
         CardTerminal terminal = pickTerminal(args);
-        if (terminal == null) {
-            System.out.println("No cyberJack reader found. Try: java PinModifyDirect cyberJack");
-            return;
-        }
+        if (terminal == null) { System.out.println("No cyberJack reader found."); return; }
         System.out.println("Using reader: " + terminal.getName());
 
         Card card = terminal.connect("*");
@@ -51,28 +52,23 @@ public class PinModifyDirect {
                 System.out.println("Features: " + tagNames(features.keySet()));
                 Integer vCtl = features.get(FEATURE_VERIFY_PIN_DIRECT);
                 Integer mCtl = features.get(FEATURE_MODIFY_PIN_DIRECT);
-                if (vCtl == null || mCtl == null) {
-                    System.out.println("Reader is missing VERIFY or MODIFY direct support.");
-                    return;
-                }
-                System.out.printf("Params: P2=%02X  PIN %d..%d  format=%02X block=%02X lenfmt=%02X%n",
-                        P2 & 0xFF, PIN_MIN, PIN_MAX, BM_FORMAT & 0xFF, BM_BLOCK & 0xFF, BM_LENFMT & 0xFF);
+                if (mCtl == null) { System.out.println("No MODIFY_PIN_DIRECT."); return; }
+                System.out.printf("Mode=%s  P2=%02X  PIN %d..%d  format=%02X block=%02X lenfmt=%02X%n",
+                        MODE, P2 & 0xFF, PIN_MIN, PIN_MAX, BM_FORMAT & 0xFF, BM_BLOCK & 0xFF, BM_LENFMT & 0xFF);
 
-                // STEP 1 - VERIFY old PIN. Its SW tells us whether P2 is correct.
-                System.out.println("\n>>> STEP 1: enter the OLD PIN at the keypad <<<");
-                int sw1 = swOf(card.transmitControlCommand(vCtl, buildVerify()));
-                System.out.printf("VERIFY  SW=%04X -> %s%n", sw1, describe(sw1));
-                if (sw1 != 0x9000) {
-                    System.out.println("Stop here: with a correct old PIN this should be 9000.");
-                    System.out.println("If it is 6A88 / 6B.. -> P2 is wrong (try -Dp2=81, 02, 00) or SELECT the app first.");
-                    System.out.println("If it is 63Cx -> P2 is RIGHT, you just mistyped the old PIN.");
-                    return;
+                if ("split".equalsIgnoreCase(MODE)) {
+                    if (vCtl == null) { System.out.println("No VERIFY_PIN_DIRECT for split mode."); return; }
+                    System.out.println("\n>>> STEP 1: enter the OLD PIN <<<");
+                    if (runSecure(card, vCtl, buildVerify(), "VERIFY") != 0x9000) {
+                        System.out.println("Stop: VERIFY must be 9000 before the change.");
+                        return;
+                    }
+                    System.out.println("\n>>> STEP 2: enter NEW PIN, then NEW PIN again <<<");
+                    runSecure(card, mCtl, buildModifyNewOnly(), "CHANGE");
+                } else {
+                    System.out.println("\n>>> Enter OLD PIN, then NEW PIN, then NEW PIN again <<<");
+                    runSecure(card, mCtl, buildModifyCombined(), "CHANGE");
                 }
-
-                // STEP 2 - CHANGE new PIN only (P1=01); old PIN already verified above.
-                System.out.println("\n>>> STEP 2: enter the NEW PIN, then the NEW PIN again <<<");
-                int sw2 = swOf(card.transmitControlCommand(mCtl, buildModifyNewOnly()));
-                System.out.printf("CHANGE  SW=%04X -> %s%n", sw2, describe(sw2));
             } finally {
                 card.endExclusive();
             }
@@ -81,38 +77,77 @@ public class PinModifyDirect {
         }
     }
 
+    private static int runSecure(Card card, int ctl, byte[] struct, String label) {
+        System.out.println(label + " struct: " + hex(struct));
+        try {
+            int sw = swOf(card.transmitControlCommand(ctl, struct));
+            System.out.printf("%s  SW=%04X -> %s%n", label, sw, describe(sw));
+            return sw;
+        } catch (CardException e) {
+            String m = e.getMessage();
+            Throwable c = e.getCause();
+            System.out.println(label + "  READER/DRIVER ERROR: " + m + (c != null ? " (" + c.getMessage() + ")" : ""));
+            System.out.println("  -> this is a reader-level abort, not a card SW.");
+            System.out.println("  -> check: both NEW entries identical? length within " + PIN_MIN + ".." + PIN_MAX + "?");
+            System.out.println("  -> if it persists on 'combined', try -Dmode=split; and vice versa.");
+            return -1;
+        }
+    }
+
     /** PIN_VERIFY_STRUCTURE + VERIFY apdu (00 20 00 P2 08 + 8-byte block). */
     private static byte[] buildVerify() {
         byte[] apdu = new byte[]{0x00, 0x20, 0x00, P2, 0x08, 0,0,0,0,0,0,0,0};
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        b.write(0x00); b.write(0x00);                 // bTimerOut, bTimerOut2
+        b.write(0x00); b.write(0x00);
         b.write(BM_FORMAT); b.write(BM_BLOCK); b.write(BM_LENFMT);
-        b.write(PIN_MIN); b.write(PIN_MAX);           // wPINMaxExtraDigit (min,max)
-        b.write(0x02);                                // bEntryValidationCondition
-        b.write(0x01);                                // bNumberMessage
-        b.write(0x09); b.write(0x04);                 // wLangId 0x0409
-        b.write(0x00);                                // bMsgIndex
-        b.write(0x00); b.write(0x00); b.write(0x00);  // bTeoPrologue
-        b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0); // ulDataLength LE
+        b.write(PIN_MIN); b.write(PIN_MAX);
+        b.write(0x02);                 // bEntryValidationCondition
+        b.write(0x01);                 // bNumberMessage
+        b.write(0x09); b.write(0x04);  // wLangId
+        b.write(0x00);                 // bMsgIndex
+        b.write(0x00); b.write(0x00); b.write(0x00);
+        b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0);
         b.write(apdu, 0, apdu.length);
         return b.toByteArray();
     }
 
-    /** PIN_MODIFY_STRUCTURE + CHANGE apdu, new PIN only (00 24 01 P2 08 + 8-byte block). */
-    private static byte[] buildModifyNewOnly() {
-        byte[] apdu = new byte[]{0x00, 0x24, 0x01, P2, 0x08, 0,0,0,0,0,0,0,0}; // P1=01
+    /** Combined change: CHANGE P1=00, OLD (offset 5) + NEW (offset 13), confirm new. */
+    private static byte[] buildModifyCombined() {
+        byte[] apdu = new byte[]{0x00, 0x24, 0x00, P2, 0x10,
+                0,0,0,0,0,0,0,0,    // old block @5
+                0,0,0,0,0,0,0,0};   // new block @13
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        b.write(0x00); b.write(0x00);                 // bTimerOut, bTimerOut2
+        b.write(0x00); b.write(0x00);
         b.write(BM_FORMAT); b.write(BM_BLOCK); b.write(BM_LENFMT);
-        b.write(0x00);                                // bInsertionOffsetOld (none)
-        b.write(0x05);                                // bInsertionOffsetNew (after 5-byte header)
-        b.write(PIN_MIN); b.write(PIN_MAX);           // wPINMaxExtraDigit (min,max)
-        b.write(0x01);                                // bConfirmPIN: confirm new, no old
-        b.write(0x02);                                // bEntryValidationCondition
-        b.write(0x02);                                // bNumberMessage: new + confirm
-        b.write(0x09); b.write(0x04);                 // wLangId 0x0409
-        b.write(0x00); b.write(0x01);                 // bMsgIndex1, bMsgIndex2
-        b.write(0x00); b.write(0x00); b.write(0x00);  // bTeoPrologue
+        b.write(0x05);                 // bInsertionOffsetOld
+        b.write(0x0D);                 // bInsertionOffsetNew (13)
+        b.write(PIN_MIN); b.write(PIN_MAX);
+        b.write(0x03);                 // bConfirmPIN: confirm new + old present
+        b.write(0x02);                 // bEntryValidationCondition
+        b.write(0x03);                 // bNumberMessage: old / new / confirm
+        b.write(0x09); b.write(0x04);
+        b.write(0x00); b.write(0x01); b.write(0x02);
+        b.write(0x00); b.write(0x00); b.write(0x00);
+        b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0);
+        b.write(apdu, 0, apdu.length);
+        return b.toByteArray();
+    }
+
+    /** New-only change: CHANGE P1=01, NEW (offset 5), confirm new. Requires prior VERIFY. */
+    private static byte[] buildModifyNewOnly() {
+        byte[] apdu = new byte[]{0x00, 0x24, 0x01, P2, 0x08, 0,0,0,0,0,0,0,0};
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        b.write(0x00); b.write(0x00);
+        b.write(BM_FORMAT); b.write(BM_BLOCK); b.write(BM_LENFMT);
+        b.write(0x00);                 // bInsertionOffsetOld (none)
+        b.write(0x05);                 // bInsertionOffsetNew
+        b.write(PIN_MIN); b.write(PIN_MAX);
+        b.write(0x01);                 // bConfirmPIN: confirm new only
+        b.write(0x02);
+        b.write(0x02);                 // bNumberMessage: new + confirm
+        b.write(0x09); b.write(0x04);
+        b.write(0x00); b.write(0x01);
+        b.write(0x00); b.write(0x00); b.write(0x00);
         b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0);
         b.write(apdu, 0, apdu.length);
         return b.toByteArray();
@@ -128,20 +163,19 @@ public class PinModifyDirect {
 
     private static String describe(int sw) {
         if (sw == 0x9000) return "SUCCESS";
-        if ((sw & 0xFFF0) == 0x63C0) return "wrong PIN, " + (sw & 0x0F) + " tries left (P2 is correct!)";
-        if ((sw & 0xFF00) == 0x6B00) return "wrong parameters P1/P2 -> wrong PIN reference (P2) or change mode (P1)";
+        if ((sw & 0xFFF0) == 0x63C0) return "wrong PIN, " + (sw & 0x0F) + " tries left";
+        if ((sw & 0xFF00) == 0x6B00) return "wrong parameters P1/P2";
         switch (sw) {
-            case 0x6A88: return "reference data (PIN) not found -> wrong P2, or SELECT the application first";
-            case 0x6A86: return "wrong P1/P2";
+            case 0x6A88: return "reference data not found -> wrong P2 or SELECT app first";
             case 0x6A80: return "wrong data / PIN block format -> format/block bytes wrong";
             case 0x6983: return "PIN BLOCKED (needs PUK)";
             case 0x6982: return "security status not satisfied";
             case 0x6985: return "conditions of use not satisfied";
             case 0x6700: return "wrong length";
             case 0x6400: return "reader timeout";
-            case 0x6401: return "user cancelled at keypad";
-            case -1:     return "no card response";
-            default:     return "unhandled - look up this SW for your card";
+            case 0x6401: return "user cancelled";
+            case -1:     return "no/failed response";
+            default:     return "unhandled - look up for your card";
         }
     }
 
