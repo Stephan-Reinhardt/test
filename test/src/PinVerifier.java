@@ -45,13 +45,13 @@ public class PinVerifier {
                 0x00,        // bTimeOut (0 = default)
                 0x00,        // bTimeOut2
                 (byte)0x82,  // bmFormatString (0x82 = ASCII, try 0x02 for BCD if it fails)
-                0x04,        // bmPINBlockString
+                0x08,        // bmPINBlockString
                 0x00,        // bmPINLengthFormat
-                0x04, 0x00,  // wPINMaxExtraDigit (Min 4) - LITTLE ENDIAN!
-                0x08, 0x00,  // wPINMaxExtraDigit (Max 8) - LITTLE ENDIAN!
+                0x08, 0x04,  // wPINMaxExtraDigit = (min<<8)+max = 0x0408, stored LE as [max, min]
                 0x02,        // bEntryValidationCondition (0x02 = OK key pressed)
-                0x00,        // bNumberMessage (0x00 = Use default reader message)
-                0x07, 0x04,  // wLangId (0x0407 = de-DE) - LITTLE ENDIAN!
+                0x04,        // bNumberMessage (0x00 = Use default reader message)
+                0x09,
+                0x00,        // wLangId
                 0x00,        // bMsgIndex
                 0x00, 0x00, 0x00, // bTeoPrologue
                 (byte)(VERIFY_APDU.length), 0x00, 0x00, 0x00 // ulDataLength - LITTLE ENDIAN!
