@@ -1,3 +1,5 @@
+package test;
+
 import javax.smartcardio.*;
 import java.io.ByteArrayOutputStream;
 import java.util.*;
@@ -25,21 +27,39 @@ public class PinModifyDirect {
             (byte)0x01,(byte)0x02,(byte)0x03,(byte)0x04,(byte)0x05,(byte)0x06,
             (byte)0x07,(byte)0x08,(byte)0x09,(byte)0x00,(byte)0x00 };
 
-    private static final byte CLA        = (byte) 0xB0;  // applet CLA
+    private static final byte CLA        = (byte) 0x00;  // OLD CODE: CLA is 00, not B0
     private static final byte INS_VERIFY = (byte) 0x20;
     private static final byte INS_CHANGE = (byte) 0x24;
 
-    private static final byte P1_VERIFY  = (byte) 0x00;
-    private static final byte P2_VERIFY  = (byte) 0x00;  // try 0x81 if 6A88/6B00
-    private static final byte P1_CHANGE  = (byte) 0x00;  // 0x00 = old+new, 0x01 = new only
-    private static final byte P2_CHANGE  = (byte) 0x00;  // try 0x81 if 6A88/6B00
+    // P2 selects WHICH pin (applet constants), not an ISO PIN reference
+    private static final byte MASTER_PIN = (byte) 0x81;
+    private static final byte USER_PIN   = (byte) 0x82;
 
-    private static final int  PIN_MIN    = 4;            // adjust to the applet's OwnerPIN
-    private static final int  PIN_MAX    = 8;
-    private static final byte BM_FORMAT  = (byte) 0x82;  // from the old app
-    private static final byte BM_BLOCK   = (byte) 0x04;  // from the old app
-    private static final byte BM_LENFMT  = (byte) 0x00;
-    private static final byte PIN_FILL   = (byte) 0xFF;  // old app filled with FF
+    // ---- change this one line to work on the master PIN instead ----
+    private static final byte PIN_TYPE   = USER_PIN;
+    // ---------------------------------------------------------------
+
+    // Format-2 PIN block: 8 bytes, first byte 0x20 (reader ORs in the length),
+    // remaining bytes FF. Lc is 0x08 even though MAX_USER_PIN_LENGTH is 6.
+    private static final byte PIN_BLOCK_HDR = (byte) 0x20;
+    private static final byte PIN_FILL      = (byte) 0xFF;
+    private static final int  LC            = 0x08;
+
+    // exactly as the old working code
+    private static final byte BM_FORMAT   = (byte) 0x82;
+    private static final byte BM_BLOCK    = (byte) 0x04;
+    private static final byte BM_LENFMT   = (byte) 0x04;  // OLD CODE: (0xF & 4)
+    private static final byte PIN_MAX_D   = (byte) 0x08;  // wPINMaxExtraDigitMax
+    private static final byte PIN_MIN_D   = (byte) 0x06;  // wPINMaxExtraDigitMin
+    private static final byte B_ENTRY_VAL = (byte) 0x02;  // bEntryValidationCondition
+
+    // ---- TEST CARD ONLY: PIN sent in software, no keypad ----
+    private static final String TEST_OLD_PIN = "111111";
+    private static final String TEST_NEW_PIN = "111111";
+    // true  = plain APDU mode (no pinpad), uses the PINs above
+    // false = secure pinpad mode
+    private static final boolean PLAIN_MODE  = true;
+    // ---------------------------------------------------------
     // ===================================================================
 
     private static int ctlCode(int code) { return 0x310000 | (code << 2); }
@@ -77,18 +97,47 @@ public class PinModifyDirect {
                     return;
                 }
 
+                // ---- PLAIN MODE: hardcoded PINs, no keypad ----
+                if (PLAIN_MODE) {
+                    System.out.println("\n=== PLAIN APDU MODE (no pinpad, TEST CARD) ===");
+                    System.out.println("old=" + TEST_OLD_PIN + "  new=" + TEST_NEW_PIN);
+                    int sv = plain(INS_VERIFY, PIN_TYPE, TEST_OLD_PIN, "VERIFY plain");
+                    if (sv == 0x9000) {
+                        System.out.println("VERIFY ok -> applet is authenticated, now changing.");
+                        int sc = plain(INS_CHANGE, PIN_TYPE, TEST_NEW_PIN, "CHANGE plain");
+                        if (sc == 0x9000) {
+                            System.out.println("\n*** PIN CHANGE SUCCEEDED via plain APDU. ***");
+                            System.out.println("The applet command is correct; only the reader");
+                            System.out.println("structure was the problem.");
+                        }
+                    } else {
+                        System.out.println("VERIFY failed - see SW above.");
+                        System.out.println("If 6A80/6700 -> the PIN block encoding below is wrong.");
+                        System.out.println("Try ENCODING = 1 (ASCII) or 2 (BCD, no format-2 header).");
+                    }
+                    return;
+                }
+
                 // ---- STEP 1: VERIFY the old PIN at the keypad ----
                 System.out.println("\n>>> Enter the OLD PIN at the keypad <<<");
                 int sw1 = run(verifyCtl, buildVerify(), "VERIFY");
                 if (sw1 != 0x9000) {
-                    System.out.println("VERIFY failed. If 6A88/6B00 -> try P2_VERIFY = 0x81.");
-                    System.out.println("If 63Cx -> P2 correct, wrong PIN typed.");
+                    System.out.println("63Cx = wrong PIN typed. 6700 = Lc/length mismatch. 6A80 = PIN block format.");
                     return;
                 }
 
                 // ---- STEP 2: CHANGE the PIN at the keypad ----
                 System.out.println("\n>>> Enter the NEW PIN, then the NEW PIN again <<<");
-                run(modifyCtl, buildChange(), "CHANGE");
+                // ---- CHANGE ATTEMPTS: leave ONE uncommented, recompile, run ----
+                // Applet reads only the NEW pin at OFFSET_CDATA, so numMsg=2 / confirm=01.
+                // Sweeping P1 and P2, since 6B80 = the applet rejects those.
+                run(modifyCtl, buildChange(0x05, 2, 0x01, 1, 0x00, PIN_TYPE), "N1 P1=00 P2=82");
+                //run(modifyCtl, buildChange(0x05, 2, 0x01, 1, 0x01, PIN_TYPE), "N2 P1=01 P2=82");
+                //run(modifyCtl, buildChange(0x05, 2, 0x01, 1, 0x02, PIN_TYPE), "N3 P1=02 P2=82");
+                //run(modifyCtl, buildChange(0x05, 2, 0x01, 1, PIN_TYPE, 0x00), "N4 P1=82 P2=00 (swapped)");
+                //run(modifyCtl, buildChange(0x05, 2, 0x01, 1, 0x00, 0x01),     "N5 P1=00 P2=01");
+                //run(modifyCtl, buildChange(0x05, 2, 0x01, 1, 0x00, 0x02),     "N6 P1=00 P2=02");
+                // ---------------------------------------------------------------
 
             } finally {
                 card.endExclusive();
@@ -110,66 +159,136 @@ public class PinModifyDirect {
         }
     }
 
-    /** PIN_VERIFY_STRUCTURE + apdu B0 20 P1 P2 08 <block>. */
+    /** PIN block encoding for plain mode: 0=format-2, 1=ASCII digits, 2=BCD no header. */
+    private static final int ENCODING = 0;
+
+    /** Plain (non-pinpad) APDU transmit. PIN travels in software - TEST CARDS ONLY. */
+    private static int plain(byte ins, byte p2, String pin, String label) {
+        try {
+            byte[] data = new byte[LC];
+            if (ENCODING == 1) {                       // ASCII '1','1',... padded FF
+                for (int i = 0; i < LC; i++)
+                    data[i] = (i < pin.length()) ? (byte) pin.charAt(i) : PIN_FILL;
+            } else if (ENCODING == 2) {                // packed BCD, no header, FF pad
+                for (int i = 0; i < LC; i++) data[i] = PIN_FILL;
+                for (int i = 0; i < pin.length(); i++) {
+                    int d = pin.charAt(i) - '0';
+                    int bi = i / 2;
+                    if (i % 2 == 0) data[bi] = (byte) ((d << 4) | 0x0F);
+                    else            data[bi] = (byte) ((data[bi] & 0xF0) | d);
+                }
+            } else {                                   // ISO format-2: 2N D D D D D D F...
+                for (int i = 0; i < LC; i++) data[i] = PIN_FILL;
+                data[0] = (byte) (0x20 | (pin.length() & 0x0F));
+                for (int i = 0; i < pin.length(); i++) {
+                    int d = pin.charAt(i) - '0';
+                    int bi = 1 + i / 2;
+                    if (i % 2 == 0) data[bi] = (byte) ((d << 4) | 0x0F);
+                    else            data[bi] = (byte) ((data[bi] & 0xF0) | d);
+                }
+            }
+            CommandAPDU c = new CommandAPDU(CLA & 0xFF, ins & 0xFF, 0x00, p2 & 0xFF, data);
+            System.out.println("[" + label + "] enc=" + ENCODING + " apdu=" + hex(c.getBytes()));
+            ResponseAPDU r = card.getBasicChannel().transmit(c);
+            System.out.printf("[%s] SW=%04X -> %s%n", label, r.getSW(), describe(r.getSW()));
+            return r.getSW();
+        } catch (CardException e) {
+            System.out.println("[" + label + "] transmit error: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /** Format-2 PIN block template: 20 FF FF FF FF FF FF FF (reader fills it in). */
+    private static byte[] pinBlock() {
+        byte[] blk = new byte[LC];
+        blk[0] = PIN_BLOCK_HDR;
+        for (int i = 1; i < LC; i++) blk[i] = PIN_FILL;
+        return blk;
+    }
+
+    /** Mirrors the old app's createPINVerifyStructure(pinType). */
     private static byte[] buildVerify() {
-        byte f = PIN_FILL;
-        byte[] apdu = {CLA, INS_VERIFY, P1_VERIFY, P2_VERIFY, 0x08, f,f,f,f,f,f,f,f};
+        ByteArrayOutputStream a = new ByteArrayOutputStream();
+        a.write(CLA); a.write(INS_VERIFY); a.write(0x00); a.write(PIN_TYPE); a.write(LC);
+        byte[] blk = pinBlock();
+        a.write(blk, 0, blk.length);
+        byte[] apdu = a.toByteArray();
+
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        b.write(0x00); b.write(0x00);               // bTimeOut, bTimeOut2
-        b.write(BM_FORMAT); b.write(BM_BLOCK); b.write(BM_LENFMT);
-        b.write(PIN_MIN); b.write(PIN_MAX);         // wPINMaxExtraDigit
-        b.write(0x02);                              // bEntryValidationCondition
-        b.write(0x01);                              // bNumberMessage
-        b.write(0x09); b.write(0x04);               // wLangId
-        b.write(0x00);                              // bMsgIndex
-        b.write(0x00); b.write(0x00); b.write(0x00);// bTeoPrologue
-        b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0);
+        b.write(0x00);            // bTimeOut
+        b.write(0x00);            // bTimeOut2
+        b.write(BM_FORMAT);       // 0x82
+        b.write(BM_BLOCK);        // 0x04
+        b.write(BM_LENFMT);       // 0x04
+        b.write(PIN_MAX_D);       // MAX first (as in the old code)
+        b.write(PIN_MIN_D);       // then MIN
+        b.write(B_ENTRY_VAL);     // bEntryValidationCondition
+        b.write(0x01);            // bNumberMessage
+        b.write(0x09); b.write(0x04);          // wLangId
+        b.write(0x00);            // bMsgIndex
+        b.write(0x00); b.write(0x00); b.write(0x00);   // bTeoPrologue
+        b.write(apdu.length);     // ulDataLength (LE)
+        b.write(0x00); b.write(0x00); b.write(0x00);
         b.write(apdu, 0, apdu.length);
         return b.toByteArray();
     }
 
     /**
-     * PIN_MODIFY_STRUCTURE + apdu B0 24 P1 P2 Lc <blocks>.
-     * P1_CHANGE 0x00 -> old block @5 and new block @13 (Lc=0x10)
-     * P1_CHANGE 0x01 -> new block @5 only (Lc=0x08)
+     * MODIFY structure. Everything matches the proven VERIFY except the fields
+     * unique to MODIFY, which are the parameters below.
+     *
+     * @param offNew  bInsertionOffsetNew (0x00 as OCR'd, or 0x05 = OFFSET_CDATA)
+     * @param numMsg  bNumberMessage (2 = new+confirm, 3 = old+new+confirm)
+     * @param confirm bConfirmPIN
+     * @param msgBase first bMsgIndex value (old code appeared to use 1)
      */
-    private static byte[] buildChange() {
-        boolean withOld = (P1_CHANGE == 0x00);
-        int lc = withOld ? 0x10 : 0x08;
-        byte f = PIN_FILL;
-
+    private static byte[] buildChange(int offNew, int numMsg, int confirm, int msgBase, int p1, int p2) {
         ByteArrayOutputStream a = new ByteArrayOutputStream();
-        a.write(CLA); a.write(INS_CHANGE); a.write(P1_CHANGE); a.write(P2_CHANGE); a.write(lc);
-        for (int i = 0; i < lc; i++) a.write(f);
+        a.write(CLA); a.write(INS_CHANGE); a.write(p1); a.write(p2); a.write(LC);
+        byte[] blk = pinBlock();
+        a.write(blk, 0, blk.length);
         byte[] apdu = a.toByteArray();
 
-        int offOld = withOld ? 5 : 0;
-        int offNew = withOld ? 13 : 5;
-        int numMsg = withOld ? 3 : 2;
-
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        b.write(0x00); b.write(0x00);
-        b.write(BM_FORMAT); b.write(BM_BLOCK); b.write(BM_LENFMT);
-        b.write(offOld);                            // bInsertionOffsetOld
-        b.write(offNew);                            // bInsertionOffsetNew
-        b.write(PIN_MIN); b.write(PIN_MAX);
-        b.write(withOld ? 0x03 : 0x01);             // bConfirmPIN
-        b.write(0x02);                              // bEntryValidationCondition
-        b.write(numMsg);                            // bNumberMessage
-        b.write(0x09); b.write(0x04);               // wLangId
-        for (int i = 0; i < numMsg; i++) b.write(i + 1);  // bMsgIndex1..N (old app used 1,2)
-        b.write(0x00); b.write(0x00); b.write(0x00);// bTeoPrologue
-        b.write(apdu.length & 0xFF); b.write(0); b.write(0); b.write(0);
+        b.write(0x00);            // bTimeOut
+        b.write(0x00);            // bTimeOut2
+        b.write(BM_FORMAT);       // 0x82   (proven by VERIFY)
+        b.write(BM_BLOCK);        // 0x04   (proven by VERIFY)
+        b.write(BM_LENFMT);       // 0x04   (proven by VERIFY)
+        b.write(0x00);            // bInsertionOffsetOld
+        b.write(offNew);          // bInsertionOffsetNew   <-- varies
+        b.write(PIN_MAX_D);       // MAX first (proven by VERIFY)
+        b.write(PIN_MIN_D);       // then MIN
+        b.write(confirm);         // bConfirmPIN           <-- varies
+        b.write(B_ENTRY_VAL);     // bEntryValidationCondition
+        b.write(numMsg);          // bNumberMessage        <-- varies
+        b.write(0x09); b.write(0x04);          // wLangId
+        for (int i = 0; i < numMsg; i++) b.write(msgBase + i);   // bMsgIndex1..N
+        b.write(0x00); b.write(0x00); b.write(0x00);   // bTeoPrologue
+        b.write(apdu.length);     // ulDataLength (LE)
+        b.write(0x00); b.write(0x00); b.write(0x00);
         b.write(apdu, 0, apdu.length);
         return b.toByteArray();
     }
 
+    /**
+     * The old working code reads SW1 at resp[0] and SW2 at resp[1] for pinpad
+     * responses. Honour that for 2-byte buffers; fall back to the tail otherwise.
+     */
     private static int swOf(byte[] r) {
-        if (r == null || r.length < 2) {
-            System.out.println("short/null response: " + (r == null ? "null" : hex(r)));
-            return -1;
+        if (r == null) { System.out.println("  raw=null"); return -1; }
+        System.out.println("  raw=" + hex(r) + "  len=" + r.length);
+        if (r.length < 2) return -1;
+        int head = ((r[0] & 0xFF) << 8) | (r[1] & 0xFF);
+        int tail = ((r[r.length - 2] & 0xFF) << 8) | (r[r.length - 1] & 0xFF);
+        int h1 = (head >> 8) & 0xFF;
+        int sw = (h1 == 0x90 || (h1 >= 0x61 && h1 <= 0x6F)) ? head : tail;
+        int sw1 = (sw >> 8) & 0xFF;
+        if (sw1 != 0x90 && (sw1 < 0x61 || sw1 > 0x6F)) {
+            System.out.println("  !! SW1=" + String.format("%02X", sw1)
+                    + " is not a legal ISO status byte -> reader/driver result, not a card SW.");
         }
-        return ((r[r.length - 2] & 0xFF) << 8) | (r[r.length - 1] & 0xFF);
+        return sw;
     }
 
     private static String describe(int sw) {
@@ -177,6 +296,10 @@ public class PinModifyDirect {
         if ((sw & 0xFFF0) == 0x63C0) return "wrong PIN, " + (sw & 0x0F) + " tries left";
         if ((sw & 0xFF00) == 0x6B00) return "wrong parameters P1/P2";
         switch (sw) {
+            case 0x69AA: return "APPLET: user PIN not verified before change";
+            case 0x69BB: return "APPLET: master PIN not verified before change";
+            case 0x00AA: return "APPLET: user PIN not verified before change";
+            case 0x00BB: return "APPLET: master PIN not verified before change";
             case 0x6D00: return "INS not supported by the selected applet";
             case 0x6E00: return "CLA not supported -> wrong class byte";
             case 0x6A82: return "file/applet not found -> AID not installed on this card";
